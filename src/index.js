@@ -1,10 +1,9 @@
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
-import { GoogleGenAI } from "@google/genai";
 import { fal } from "@fal-ai/client";
 import { createServer } from "node:http";
 
-const required = ["TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "FAL_KEY"];
+const required = ["TELEGRAM_BOT_TOKEN", "GROQ_API_KEY", "FAL_KEY"];
 const missing = required.filter((key) => !process.env[key]);
 
 if (missing.length) {
@@ -13,10 +12,9 @@ if (missing.length) {
 }
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 fal.config({ credentials: process.env.FAL_KEY });
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GROQ_MODEL = process.env.GROQ_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
 const IMAGE_MODEL = process.env.FAL_IMAGE_TO_VIDEO_MODEL || "fal-ai/ovi/image-to-video";
 const TEXT_MODEL = process.env.FAL_TEXT_TO_VIDEO_MODEL || "fal-ai/ovi";
 
@@ -112,23 +110,37 @@ Untuk setiap konsep berikan:
 Kembalikan JSON valid saja dengan bentuk:
 {"product_summary":"...","concepts":[{"title":"...","style":"...","description":"...","prompt":"...","hook":"...","caption":"...","hashtags":["..."]}]}
 `;
-  const response = await gemini.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: mime, data: base64 } }
-      ]
-    }],
-    config: { responseMimeType: "application/json", temperature: 0.8 }
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      temperature: 0.8,
+      max_tokens: 2500,
+      response_format: { type: "json_object" },
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } }
+        ]
+      }]
+    })
   });
 
-  const raw = response.text || "";
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 600);
+    throw new Error(`Groq API ${response.status}: ${detail}`);
+  }
+  const payload = await response.json();
+  const raw = payload?.choices?.[0]?.message?.content || "";
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   const parsed = JSON.parse(cleaned);
   if (!Array.isArray(parsed.concepts) || parsed.concepts.length < 1) {
-    throw new Error("Gemini tidak menghasilkan daftar konsep yang valid.");
+    throw new Error("Groq tidak menghasilkan daftar konsep yang valid.");
   }
   return parsed;
 }
@@ -242,7 +254,7 @@ bot.on("photo", async (ctx) => {
   } catch (error) {
     console.error("Photo analysis error:", error);
     userState.delete(ctx.from.id);
-    await ctx.reply("❌ Gagal menganalisis foto. Cek API Gemini dan log Railway, lalu coba lagi.\\nDetail: " + String(error?.message || error).slice(0, 250));
+    await ctx.reply("❌ Gagal menganalisis foto. Cek GROQ_API_KEY, model Groq, dan log Railway, lalu coba lagi.\\nDetail: " + String(error?.message || error).slice(0, 250));
   }
 });
 

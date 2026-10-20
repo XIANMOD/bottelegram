@@ -254,10 +254,19 @@ async function generateAndSend(ctx, { model, input, concept }) {
       caption: captionParts.join("\n").slice(0, 1024)
     });
   } catch (error) {
-    console.error("Video generation error:", error);
+    console.error("Video generation error:", error?.status, JSON.stringify(error?.body || null), error);
+    let detail = String(error?.message || error);
+    if (error?.body) {
+      const body = typeof error.body === "string" ? error.body : JSON.stringify(error.body);
+      detail += ` | ${error.status || ""} ${body}`;
+    }
+    let hint = "";
+    if (error?.status === 403 || /forbidden|locked|exhausted|balance/i.test(detail)) {
+      hint = "\n\n💡 403 dari fal.ai biasanya berarti saldo fal.ai habis/akun terkunci, atau FAL_KEY salah/tidak punya akses. Cek https://fal.ai/dashboard/billing dan FAL_KEY di Railway.";
+    }
     await ctx.reply(
       "❌ Generate gagal. Belum ada sistem kredit di prototype ini, jadi cek dashboard fal.ai untuk memastikan apakah request dikenakan biaya.\n\n" +
-      "Detail: " + String(error?.message || error).slice(0, 350)
+      "Detail: " + detail.slice(0, 350) + hint
     );
   } finally {
     userState.delete(ctx.from.id);

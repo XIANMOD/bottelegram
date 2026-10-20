@@ -45,4 +45,5 @@ Do not paste API keys into source code, GitHub, screenshots, or chat messages.
 ## API references
 - fal.ai Ovi image-to-video: https://fal.ai/models/fal-ai/ovi/image-to-video/api
 - fal.ai Ovi text-to-video: https://fal.ai/models/fal-ai/ovi/api
-- Google Groq API pricing/docs: https://ai.google.dev/gemini-api/docs
+- Groq vision models: https://console.groq.com/docs/vision
+- Groq deprecations: https://console.groq.com/docs/deprecations

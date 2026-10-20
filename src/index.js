@@ -14,7 +14,11 @@ if (missing.length) {
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 fal.config({ credentials: process.env.FAL_KEY });
 
-const GROQ_MODEL = process.env.GROQ_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
+// Groq vision models change often (llama-4-scout and qwen3.6-27b have both been shut down).
+// The bot tries GROQ_MODEL first (if set), then falls back to the models below.
+// If you set GROQ_MODEL in Railway, make sure it is still listed at https://console.groq.com/docs/vision
+const GROQ_FALLBACK_MODELS = ["qwen/qwen3.8-27b"];
+const GROQ_MODELS = [...new Set([process.env.GROQ_MODEL, ...GROQ_FALLBACK_MODELS].filter(Boolean))];
 const IMAGE_MODEL = process.env.FAL_IMAGE_TO_VIDEO_MODEL || "fal-ai/ovi/image-to-video";
 const TEXT_MODEL = process.env.FAL_TEXT_TO_VIDEO_MODEL || "fal-ai/ovi";
 
@@ -31,10 +35,10 @@ const mainMenu = Markup.inlineKeyboard([
 bot.start(async (ctx) => {
   userState.delete(ctx.from.id);
   await ctx.reply(
-    "🔥 *COMBO AI AFFILIATE BOT — MVP*\\n\\n" +
-    "Bikin konsep video affiliate dari foto produk atau prompt teks.\\n\\n" +
-    "📸 *Video dari Foto:* kirim foto produk, AI akan memberi 5 konsep.\\n" +
-    "✍️ *Video dari Prompt:* tulis ide video, lalu AI akan membuat video.\\n\\n" +
+    "🔥 *COMBO AI AFFILIATE BOT — MVP*\n\n" +
+    "Bikin konsep video affiliate dari foto produk atau prompt teks.\n\n" +
+    "📸 *Video dari Foto:* kirim foto produk, AI akan memberi 5 konsep.\n" +
+    "✍️ *Video dari Prompt:* tulis ide video, lalu AI akan membuat video.\n\n" +
     "Catatan: proses generate menggunakan API berbayar. Prototype ini belum memakai sistem kredit/pembayaran.",
     { parse_mode: "Markdown", ...mainMenu }
   );
@@ -48,7 +52,7 @@ bot.command("cancel", async (ctx) => {
 bot.command("textvideo", async (ctx) => {
   userState.set(ctx.from.id, { mode: "waiting_text_prompt" });
   await ctx.reply(
-    "Kirim prompt video yang kamu mau dalam satu pesan.\\n\\n" +
+    "Kirim prompt video yang kamu mau dalam satu pesan.\n\n" +
     "Contoh: Cinematic product ad for a minimalist black water bottle, slow camera orbit, studio lighting, premium commercial style. No text or logos added."
   );
 });
@@ -68,10 +72,10 @@ bot.action("menu_text", async (ctx) => {
 bot.action("menu_tips", async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply(
-    "💡 *Tips konten affiliate*\\n\\n" +
-    "• Tampilkan bentuk dan detail produk dengan jelas.\\n" +
-    "• Gunakan hook yang menarik tanpa klaim berlebihan.\\n" +
-    "• Cocokkan konsep dengan kategori produk.\\n" +
+    "💡 *Tips konten affiliate*\n\n" +
+    "• Tampilkan bentuk dan detail produk dengan jelas.\n" +
+    "• Gunakan hook yang menarik tanpa klaim berlebihan.\n" +
+    "• Cocokkan konsep dengan kategori produk.\n" +
     "• Periksa hasil video sebelum diunggah; AI bisa mengubah detail produk.",
     { parse_mode: "Markdown", ...mainMenu }
   );
@@ -110,39 +114,78 @@ Untuk setiap konsep berikan:
 Kembalikan JSON valid saja dengan bentuk:
 {"product_summary":"...","concepts":[{"title":"...","style":"...","description":"...","prompt":"...","hook":"...","caption":"...","hashtags":["..."]}]}
 `;
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0.8,
-      max_tokens: 2500,
-      response_format: { type: "json_object" },
-      messages: [{
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } }
-        ]
-      }]
-    })
-  });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let lastError;
 
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 600);
-    throw new Error(`Groq API ${response.status}: ${detail}`);
+  for (const model of GROQ_MODELS) {
+    // Up to 3 attempts per model for temporary errors (429 / 5xx / network).
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let response;
+      try {
+        response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.8,
+            max_tokens: 4000,
+            response_format: { type: "json_object" },
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } }
+              ]
+            }]
+          })
+        });
+      } catch (networkError) {
+        lastError = new Error(`Groq network error (${model}): ${networkError.message}`);
+        await sleep(attempt * 1500);
+        continue;
+      }
+
+      if (response.ok) {
+        const payload = await response.json();
+        const parsed = parseConcepts(payload?.choices?.[0]?.message?.content || "");
+        if (parsed) return parsed;
+        lastError = new Error(`Groq (${model}) tidak menghasilkan JSON konsep yang valid.`);
+        break; // bad output: try the next model
+      }
+
+      const detail = (await response.text()).slice(0, 600);
+      lastError = new Error(`Groq API ${response.status} (${model}): ${detail}`);
+      console.error(lastError.message);
+
+      if (response.status === 429 || response.status >= 500) {
+        await sleep(attempt * 1500);
+        continue; // temporary: retry same model
+      }
+      if (response.status === 404 || response.status === 400) {
+        console.warn(`Model ${model} tidak tersedia/ditolak, mencoba model berikutnya...`);
+        break; // model gone or rejected: try the next model
+      }
+      throw lastError; // 401/403 etc: API key problem, no point retrying
+    }
   }
-  const payload = await response.json();
-  const raw = payload?.choices?.[0]?.message?.content || "";
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  const parsed = JSON.parse(cleaned);
-  if (!Array.isArray(parsed.concepts) || parsed.concepts.length < 1) {
-    throw new Error("Groq tidak menghasilkan daftar konsep yang valid.");
+  throw lastError || new Error("Tidak ada model Groq yang bisa dipakai.");
+}
+
+function parseConcepts(raw) {
+  // Some reasoning models prepend <think>...</think>; strip it, then pull out the JSON object.
+  let text = String(raw).replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) return null;
+  try {
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    return Array.isArray(parsed.concepts) && parsed.concepts.length ? parsed : null;
+  } catch {
+    return null;
   }
-  return parsed;
 }
 
 function conceptsKeyboard(concepts) {
@@ -166,7 +209,7 @@ bot.action(/^concept_(\d+)$/, async (ctx) => {
     model: IMAGE_MODEL,
     input: {
       image_url: state.dataUri,
-      prompt: `${concept.prompt}\\nCommercial product video, vertical social-media framing, keep the product's visible design consistent.`
+      prompt: `${concept.prompt}\nCommercial product video, vertical social-media framing, keep the product's visible design consistent.`
     },
     concept
   });
@@ -179,7 +222,7 @@ bot.action("cancel_pending", async (ctx) => {
 });
 
 async function generateAndSend(ctx, { model, input, concept }) {
-  const status = await ctx.reply("🎬 *Sedang membuat video...*\\n\\nProses dapat memerlukan beberapa menit. Jangan kirim ulang dulu ya.", { parse_mode: "Markdown" });
+  const status = await ctx.reply("🎬 *Sedang membuat video...*\n\nProses dapat memerlukan beberapa menit. Jangan kirim ulang dulu ya.", { parse_mode: "Markdown" });
   try {
     const result = await fal.subscribe(model, {
       input,
@@ -197,7 +240,7 @@ async function generateAndSend(ctx, { model, input, concept }) {
 
     // Telegram bot video uploads are size-limited. Fail clearly rather than crashing.
     if (videoBuffer.length > 49 * 1024 * 1024) {
-      await ctx.reply(`Video berhasil dibuat, tetapi ukuran file terlalu besar untuk dikirim langsung lewat bot.\\n\\nHasil: ${videoUrl}`);
+      await ctx.reply(`Video berhasil dibuat, tetapi ukuran file terlalu besar untuk dikirim langsung lewat bot.\n\nHasil: ${videoUrl}`);
       return;
     }
 
@@ -206,14 +249,14 @@ async function generateAndSend(ctx, { model, input, concept }) {
     if (concept?.hook) captionParts.push(`🪝 Hook: ${concept.hook}`);
     if (concept?.caption) captionParts.push(`📝 ${concept.caption}`);
     if (Array.isArray(concept?.hashtags)) captionParts.push(concept.hashtags.join(" "));
-    captionParts.push("\\nPeriksa detail produk dan hasil AI sebelum mengunggah.");
+    captionParts.push("\nPeriksa detail produk dan hasil AI sebelum mengunggah.");
     await ctx.telegram.sendVideo(ctx.chat.id, { source: videoBuffer, filename: "affiliate-video.mp4" }, {
-      caption: captionParts.join("\\n").slice(0, 1024)
+      caption: captionParts.join("\n").slice(0, 1024)
     });
   } catch (error) {
     console.error("Video generation error:", error);
     await ctx.reply(
-      "❌ Generate gagal. Belum ada sistem kredit di prototype ini, jadi cek dashboard fal.ai untuk memastikan apakah request dikenakan biaya.\\n\\n" +
+      "❌ Generate gagal. Belum ada sistem kredit di prototype ini, jadi cek dashboard fal.ai untuk memastikan apakah request dikenakan biaya.\n\n" +
       "Detail: " + String(error?.message || error).slice(0, 350)
     );
   } finally {
@@ -239,22 +282,22 @@ bot.on("photo", async (ctx) => {
     });
 
     const overview = String(result.product_summary || "Produk berhasil dianalisis.");
-    const text = `🧠 *Analisis produk:* ${overview}\\n\\nPilih konsep yang ingin dibuat jadi video:`;
+    const text = `🧠 *Analisis produk:* ${overview}\n\nPilih konsep yang ingin dibuat jadi video:`;
     await ctx.reply(text, { parse_mode: "Markdown", ...conceptsKeyboard(concepts) });
 
     // Send short concept details as a separate message for easier reading.
     for (let i = 0; i < concepts.length; i++) {
       const c = concepts[i];
       await ctx.reply(
-        `*${i + 1}. ${c.title || `Konsep ${i + 1}`}*\\n${c.description || ""}\\n` +
-        (c.hook ? `Hook: ${c.hook}\\n` : ""),
+        `*${i + 1}. ${c.title || `Konsep ${i + 1}`}*\n${c.description || ""}\n` +
+        (c.hook ? `Hook: ${c.hook}\n` : ""),
         { parse_mode: "Markdown" }
       );
     }
   } catch (error) {
     console.error("Photo analysis error:", error);
     userState.delete(ctx.from.id);
-    await ctx.reply("❌ Gagal menganalisis foto. Cek GROQ_API_KEY, model Groq, dan log Railway, lalu coba lagi.\\nDetail: " + String(error?.message || error).slice(0, 250));
+    await ctx.reply("❌ Gagal menganalisis foto. Cek GROQ_API_KEY, model Groq, dan log Railway, lalu coba lagi.\nDetail: " + String(error?.message || error).slice(0, 250));
   }
 });
 
@@ -273,7 +316,7 @@ bot.on("text", async (ctx) => {
     await generateAndSend(ctx, {
       model: TEXT_MODEL,
       input: {
-        prompt: `${prompt}\\nCreate a polished social-media product advertisement. Avoid unsupported claims, fake labels, and added text.`
+        prompt: `${prompt}\nCreate a polished social-media product advertisement. Avoid unsupported claims, fake labels, and added text.`
       }
     });
   }
